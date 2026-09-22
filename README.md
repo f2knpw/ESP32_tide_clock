@@ -1,7 +1,7 @@
 # ESP32_tide_clock
 A water based tide clock
 
-This code run on an ESP32 lolin 32 lite and activates water peristaltic pumps to fill/drain a water tanks. It follows exactly the tides at your local place and time.
+This code run on an ESP32 lolin 32 lite and activates water peristaltic pumps to fill/drain a water tank. It follows exactly the tides at your local place and time.
 
 The full project is described on my hackaday's pages : https://hackaday.io/project/206721-a-water-based-tide-clock
 
