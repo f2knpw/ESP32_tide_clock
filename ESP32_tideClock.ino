@@ -33,6 +33,8 @@ String wifiPassword = "";
 // --- API Maree ---
 const char* apiKey = "YOUR APIKEY"; //https://api-maree.fr/ --> for French Atlantic tides
 const char* siteId = "boucau-bayonne-biarritz";
+//attibution : Données de marée fournies par api-maree.fr sous licence CC BY, calculées à partir de composantes harmoniques Ifremer / PREVIMER, elles-mêmes sous licence CC BY.
+
 
 // --- Steppers pins ---
 #define DIR1_PIN 14
