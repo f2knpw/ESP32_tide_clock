@@ -1,3 +1,5 @@
+
+
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -9,8 +11,8 @@
 
 #include "web_server.h"
 
-// library for stepper motor
-#include <AccelStepper.h>  //https://www.airspayce.com/mikem/arduino/AccelStepper/
+// library for stepper motor : board Espressif Lolin32 lite v3.3.12
+#include "FastAccelStepper.h" //https://github.com/gin66/FastAccelStepper/tree/master
 
 // -------------------------------------------------------------------------
 // RAM RTC
@@ -23,6 +25,7 @@ RTC_NOINIT_ATTR uint32_t rtcMagicNumber;
 RTC_NOINIT_ATTR long     rtcStepper1Pos;
 RTC_NOINIT_ATTR long     rtcStepper2Pos;
 RTC_NOINIT_ATTR uint32_t rtcWasNormal;   // 1 = system was in NORMAL mode before reset
+long logStepperPosition = 0; 
 
 // --- Signalisation ---
 #define LED_PIN 22
@@ -35,7 +38,7 @@ const unsigned long WIFI_CHECK_INTERVAL_MS = 30000UL;
 unsigned long lastWifiCheck = 0;
 
 // --- API Maree ---
-const char* apiKey = "YOUR_API_KEY"; //https://api-maree.fr/ --> for French Atlantic tides
+const char* apiKey = "0ae3b_YOUR_API_KEY_49aaf"; //https://api-maree.fr/ --> for French Atlantic tides
 const char* siteId = "boucau-bayonne-biarritz";
 //attibution : Données de marée fournies par api-maree.fr sous licence CC BY, calculées à partir de composantes harmoniques Ifremer / PREVIMER, elles-mêmes sous licence CC BY.
 const unsigned long API_RETRY_INTERVAL_MS = 10UL * 60UL * 1000UL; // retry every 10 min on failure
@@ -51,20 +54,22 @@ unsigned long lastApiAttempt = 0;
 //Leds pins
 #define EBB_TIDE_PIN 27
 #define FLOOD_TIDE_PIN 26
-// Configuration PWM LEDC
-const int FLOOD_LEDC_CHANNEL = 0;
-const int EBB_LEDC_CHANNEL   = 1;
+// Configuration PWM LEDC (Compatible ESP32 Core v3.x)
 const int LEDC_FREQ = 5000;     // 5 kHz
 const int LEDC_RES = 8;         // Résolution 8 bits (0 - 255)
 const int LED_BRIGHTNESS = 64;  // Intensity  (~25% de 255)
-AccelStepper stepper1(AccelStepper::DRIVER, STEP1_PIN, DIR1_PIN);
-AccelStepper stepper2(AccelStepper::DRIVER, STEP2_PIN, DIR2_PIN);
+
+// --- Instances FastAccelStepper ---
+FastAccelStepperEngine engine;
+FastAccelStepper *stepper1 = NULL;
+FastAccelStepper *stepper2 = NULL;
 
 // --- Speeds ---
-const float MANUAL_MAX_SPEED       = 1000.0f;
-const float DRAIN_SPEED            = -500.0f;
-const float CALIB_SPEED            = 400.0f;
-const float NORMAL_MOVE_DURATION_S = 30.0f;   // time to reach the H+1 level (3600 for a smooth move over the hour)
+const uint32_t ABSOLUTE_MAX_SPEED     = 20000;
+const uint32_t DRAIN_SPEED            = 18000;
+const uint32_t CALIB_SPEED            = 10000;
+const uint32_t MOTOR_ACCEL            = 3000;
+const float NORMAL_MOVE_DURATION_S = 3100.0f;   // time to reach the H+1 level (3600 for a smooth move over the hour)
 
 // --- state machine and Calibration ---
 enum SystemState {
@@ -79,7 +84,7 @@ bool isHomed = false;   // true only when the physical zero is known
 
 // --- physical ladder on the 3d model ---
 const int TOTAL_RUNGS = 24;
-const int MEAN_LEVEL_RUNG_INDEX = 10;                     // mid tide fixed to rung 10
+const int MEAN_LEVEL_RUNG_INDEX = 7;                     // mid tide fixed to rung 10
 int maxTargetRungCoef120 = 2 * MEAN_LEVEL_RUNG_INDEX;     // high tide coef 120 = rung 20 (exact by construction)
 float meanWaterLevelHeight = 0.0;                         // today's mid tide level (m)
 float stepHeightPerRung     = 0.0;                        // height per rung (m)
@@ -106,7 +111,7 @@ float hourlyWaterLevels[LEVEL_SLOTS];
 bool hourlyLevelsValid = false;
 
 // --- functions Declarations ---
-void setDualPumpsSpeed(float speed);
+void setDualPumpsSpeed(uint32_t speed);
 void stopDualPumps();
 void processCalibrationCommand(String command);
 void startEmptyingProcess();
@@ -132,6 +137,7 @@ void handleTideSchedule();
 void handleWifi();
 void handleLedBlink();
 int getCurrentRungFromPosition();
+void setRungPosition(int targetRung);
 
 // =========================================================================
 // SETUP
@@ -142,22 +148,33 @@ void setup() {
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
- // Attach LEDC with frequency and resolution
- ledcSetup(FLOOD_LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
-ledcAttachPin(FLOOD_TIDE_PIN, FLOOD_LEDC_CHANNEL);
-ledcSetup(EBB_LEDC_CHANNEL, LEDC_FREQ, LEDC_RES);
-ledcAttachPin(EBB_TIDE_PIN, EBB_LEDC_CHANNEL);
+  
+  // Attach LEDC with frequency and resolution (Compatible ESP32 Core v3.x)
+  ledcAttach(FLOOD_TIDE_PIN, LEDC_FREQ, LEDC_RES);
+  ledcAttach(EBB_TIDE_PIN, LEDC_FREQ, LEDC_RES);
+  
   // dimmed at startup
-  ledcWrite(FLOOD_LEDC_CHANNEL, 0);
-ledcWrite(EBB_LEDC_CHANNEL, 0);
-  // Steppers Initialisation
+  ledcWrite(FLOOD_TIDE_PIN, 0);
+  ledcWrite(EBB_TIDE_PIN, 0);
+
+  // Steppers Initialisation via FastAccelStepper Engine
   pinMode(ENABLE_PIN, OUTPUT);
   digitalWrite(ENABLE_PIN, LOW); // Activate drivers
 
-  stepper1.setMaxSpeed(MANUAL_MAX_SPEED);
-  stepper1.setAcceleration(500);
-  stepper2.setMaxSpeed(MANUAL_MAX_SPEED);
-  stepper2.setAcceleration(500);
+  engine.init();
+  stepper1 = engine.stepperConnectToPin(STEP1_PIN);
+  stepper2 = engine.stepperConnectToPin(STEP2_PIN);
+
+  if (stepper1) {
+    stepper1->setDirectionPin(DIR1_PIN);
+    stepper1->setAutoEnable(false);
+    stepper1->setAcceleration(MOTOR_ACCEL);
+  }
+  if (stepper2) {
+    stepper2->setDirectionPin(DIR2_PIN);
+    stepper2->setAutoEnable(false);
+    stepper2->setAcceleration(MOTOR_ACCEL);
+  }
 
   preferences.begin("tideClock", false);
   wifiSsid = preferences.getString("ssid", "YOUR_SSID");
@@ -217,6 +234,7 @@ ledcWrite(EBB_LEDC_CHANNEL, 0);
     lastFetchedHour = -1; // force a tide update on the first loop
     Serial.println("[SYSTEM] Resuming NORMAL mode after reset.");
   }
+  logStepperPosition = millis();
 }
 
 // =========================================================================
@@ -233,37 +251,17 @@ void loop() {
     digitalWrite(LED_PIN, LOW);
   }
 
-  // handling machine state and steppers
-  switch (currentState) {
-    case STATE_DRAINING_ZERO:
-      stepper1.runSpeed();
-      stepper2.runSpeed();
-
-      // non blocking draining end
-      if (labs(stepper1.currentPosition() - drainStartPos) >= drainTargetSteps) {
-        confirmPhysicalZero();
-        currentState = STATE_NORMAL;
-        lastFetchedHour = -1; // force a tide update
-        Serial.println("[SYSTEM] Emergency draining finished. Homing/Zero calibrated -> Switch to NORMAL MODE.");
-      }
-      break;
-
-    case STATE_CALIBRATING:
-      stepper1.runSpeed();
-      stepper2.runSpeed();
-      break;
-
-    case STATE_NORMAL:
-      stepper1.runSpeedToPosition();
-      stepper2.runSpeedToPosition();
-      break;
-
-    case STATE_IDLE:
-    default:
-      break;
+  // Vérification de la fin du vidage d'urgence (géré de manière non bloquante en arrière-plan)
+  if (currentState == STATE_DRAINING_ZERO) {
+    if (labs(stepper1->getCurrentPosition() - drainStartPos) >= drainTargetSteps) {
+      confirmPhysicalZero();
+      currentState = STATE_NORMAL;
+      lastFetchedHour = -1; // force a tide update
+      Serial.println("[SYSTEM] Emergency draining finished. Homing/Zero calibrated -> Switch to NORMAL MODE.");
+    }
   }
 
-  // save position to RAM RTC (only when the zero is known)
+  // save position to RAM RTC (only when the zero is known) et log toutes les 10s
   if (currentState != STATE_DRAINING_ZERO) {
     savePositionsToRTC();
   }
@@ -313,13 +311,13 @@ void handleTideSchedule() {
 }
 
 // -------------------------------------------------------------------------
-// RAM RTC
+// RAM RTC & Periodic Logging
 // -------------------------------------------------------------------------
 void savePositionsToRTC() {
   if (!isHomed) return;
 
-  long p1 = stepper1.currentPosition();
-  long p2 = stepper2.currentPosition();
+  long p1 = stepper1->getCurrentPosition();
+  long p2 = stepper2->getCurrentPosition();
 
   // During calibration the motor position is relative to the last validated rung
   if (currentState == STATE_CALIBRATING) {
@@ -332,12 +330,19 @@ void savePositionsToRTC() {
   rtcStepper2Pos = p2;
   rtcWasNormal   = (currentState == STATE_NORMAL) ? 1 : 0;
   rtcMagicNumber = RTC_MAGIC_KEY;
+
+  // Log toutes les 10 secondes de la position absolue des steppers
+  if ((millis() - logStepperPosition) > 10000) {
+    int currentRung = getCurrentRungFromPosition();
+    Serial.printf("[LOG] Stepper 1 (Abs) : %ld pas | Stepper 2 (Abs) : %ld pas | Rung : %d\n", p1, p2, currentRung);
+    logStepperPosition = millis();
+  }
 }
 
 bool restorePositionsFromRTC() {
   if (rtcMagicNumber == RTC_MAGIC_KEY) {
-    stepper1.setCurrentPosition(rtcStepper1Pos);
-    stepper2.setCurrentPosition(rtcStepper2Pos);
+    stepper1->setCurrentPosition(rtcStepper1Pos);
+    stepper2->setCurrentPosition(rtcStepper2Pos);
     isHomed = true;
 
     Serial.println("==========================================");
@@ -353,8 +358,8 @@ bool restorePositionsFromRTC() {
   Serial.println("==========================================");
 
   rtcWasNormal = 0;
-  stepper1.setCurrentPosition(0);
-  stepper2.setCurrentPosition(0);
+  stepper1->setCurrentPosition(0);
+  stepper2->setCurrentPosition(0);
   startEmptyingProcess();
   return false;
 }
@@ -401,7 +406,7 @@ void updateCurrentTideLevel() {
   int nextIndex = currentHour + 1;               // 1..24 (24 = tomorrow 00h)
   int nextHourDisplay = nextIndex % 24;
   
-   int nextHour = (currentHour + 1) % 24;
+  int nextHour = (currentHour + 1) % 24;
 
   float currentHeight = hourlyWaterLevels[currentHour];
   float nextHeight = hourlyWaterLevels[nextHour];
@@ -409,56 +414,50 @@ void updateCurrentTideLevel() {
   // --- LEDs following tide ---
   if (nextHeight > currentHeight) {
     // Flood tide
-    ledcWrite(FLOOD_LEDC_CHANNEL, LED_BRIGHTNESS);
-    ledcWrite(EBB_LEDC_CHANNEL, 0);
+    ledcWrite(FLOOD_TIDE_PIN, LED_BRIGHTNESS);
+    ledcWrite(EBB_TIDE_PIN, 0);
   } else if (nextHeight < currentHeight) {
     // Ebb tide
-    ledcWrite(FLOOD_LEDC_CHANNEL, 0);
-    ledcWrite(EBB_LEDC_CHANNEL, LED_BRIGHTNESS);
+    ledcWrite(FLOOD_TIDE_PIN, 0);
+    ledcWrite(EBB_TIDE_PIN, LED_BRIGHTNESS);
   } else {
     // no tide
-    ledcWrite(FLOOD_LEDC_CHANNEL, 0);
-    ledcWrite(EBB_LEDC_CHANNEL, 0);
+    ledcWrite(FLOOD_TIDE_PIN, 0);
+    ledcWrite(EBB_TIDE_PIN, 0);
   }
-
-
 
   nextHeight = hourlyWaterLevels[nextIndex];
   float nextFractionalRung = convertHeightToRungIndex(nextHeight);
   long targetSteps = convertFractionalRungToAbsoluteSteps(nextFractionalRung);
 
-  long currentPosition = stepper1.currentPosition();
+  long currentPosition = stepper1->getCurrentPosition();
   long deltaSteps = targetSteps - currentPosition;
-  float moveSpeed = (float)deltaSteps / NORMAL_MOVE_DURATION_S;
+  float moveSpeed = fabsf((float)deltaSteps / NORMAL_MOVE_DURATION_S);
+  if (moveSpeed < 100.0f) moveSpeed = 100.0f;
+  if (moveSpeed > ABSOLUTE_MAX_SPEED) moveSpeed = ABSOLUTE_MAX_SPEED;
 
   Serial.printf("\n[NORMAL MODE] %02dh00 -> %02dh00 | Target (H+1) : %.3f m (Rung %.2f)\n",
                 currentHour, nextHourDisplay, nextHeight, nextFractionalRung);
   Serial.printf("Position : %ld steps | Target : %ld steps | Speed : %.4f steps/sec\n",
                 currentPosition, targetSteps, moveSpeed);
 
-  stepper1.moveTo(targetSteps);
-  stepper2.moveTo(targetSteps);
-
-  // setSpeed() must be called AFTER moveTo() (moveTo recomputes the speed)
-  setDualPumpsSpeed(moveSpeed);
+  stepper1->setSpeedInHz((uint32_t)moveSpeed);
+  stepper2->setSpeedInHz((uint32_t)moveSpeed);
+  stepper1->moveTo(targetSteps);
+  stepper2->moveTo(targetSteps);
 }
 
-void setDualPumpsSpeed(float speed) {
-  // AccelStepper::setSpeed() clamps to maxSpeed: always restore a sufficient maxSpeed
-  float maxS = fabsf(speed);
-  if (maxS < MANUAL_MAX_SPEED) maxS = MANUAL_MAX_SPEED;
+void setDualPumpsSpeed(uint32_t speed) {
+  if (speed > ABSOLUTE_MAX_SPEED) speed = ABSOLUTE_MAX_SPEED;
+  if (speed < 100) speed = 100;
 
-  stepper1.setMaxSpeed(maxS);
-  stepper2.setMaxSpeed(maxS);
-  stepper1.setSpeed(speed);
-  stepper2.setSpeed(speed);
+  stepper1->setSpeedInHz(speed);
+  stepper2->setSpeedInHz(speed);
 }
 
 void stopDualPumps() {
-  stepper1.setSpeed(0);
-  stepper2.setSpeed(0);
-  stepper1.stop();
-  stepper2.stop();
+  if (stepper1) stepper1->stopMove();
+  if (stepper2) stepper2->stopMove();
 }
 
 // -------------------------------------------------------------------------
@@ -471,13 +470,17 @@ void startEmptyingProcess() {
   rtcWasNormal = 0;
 
   currentState = STATE_DRAINING_ZERO;
-  drainStartPos = stepper1.currentPosition();
+  drainStartPos = stepper1->getCurrentPosition();
 
   // Total volume of the whole ladder (margin above coef 120 rung)
   drainTargetSteps = convertRungToAbsoluteSteps(TOTAL_RUNGS);
   if (drainTargetSteps <= 0) drainTargetSteps = 24000; // Security: calibration empty
 
-  setDualPumpsSpeed(DRAIN_SPEED);
+  stepper1->setSpeedInHz(DRAIN_SPEED);
+  stepper2->setSpeedInHz(DRAIN_SPEED);
+  stepper1->moveTo(drainStartPos - drainTargetSteps);
+  stepper2->moveTo(drainStartPos - drainTargetSteps);
+
   Serial.printf("\n[HOMING] draining during %ld steps.\n", drainTargetSteps);
 }
 
@@ -490,14 +493,15 @@ void stopEmptyingProcess() {
 }
 
 void confirmPhysicalZero() {
-  stopDualPumps();
+  // Stoppe net les moteurs et force la position à 0 sans dérive de décélération
+  if (stepper1) stepper1->forceStopAndNewPosition(0);
+  if (stepper2) stepper2->forceStopAndNewPosition(0);
+  
   digitalWrite(LED_PIN, LOW);
-
-  stepper1.setCurrentPosition(0);
-  stepper2.setCurrentPosition(0);
   isHomed = true;
 
   savePositionsToRTC();
+  Serial.println("[SYSTEM] Zero physique confirmé et verrouillé à 0 pas.");
 }
 
 void processCalibrationCommand(String command) {
@@ -541,28 +545,41 @@ void processCalibrationCommand(String command) {
   // 4. launch step by step calibration (only from IDLE, tank empty)
   else if (command == "CALIB:BEGIN_STEPS") {
     if (currentState == STATE_IDLE) {
-      if (!isHomed || stepper1.currentPosition() != 0) {
+      if (!isHomed || stepper1->getCurrentPosition() != 0) {
         Serial.println("[CALIB] Refused : tank must be empty (send SYS:HOME then EMPTY_OK).");
         return;
       }
       stopDualPumps();
-      stepper1.setCurrentPosition(0);
-      stepper2.setCurrentPosition(0);
+      stepper1->setCurrentPosition(0);
+      stepper2->setCurrentPosition(0);
       currentCalibrationRung = 0;
       currentState = STATE_CALIBRATING;
       Serial.printf("[CALIB] Calibration started. Target high tide Coef 120 : rung %d/%d\n",
                     maxTargetRungCoef120, TOTAL_RUNGS);
 
-      setDualPumpsSpeed(CALIB_SPEED);
+      stepper1->setSpeedInHz(CALIB_SPEED);
+      stepper2->setSpeedInHz(CALIB_SPEED);
+      stepper1->runForward();
+      stepper2->runForward();
     }
   }
 
   // 5. manual control of pumps
   else if (command == "PUMP:UP") {
-    if (currentState == STATE_CALIBRATING) setDualPumpsSpeed(CALIB_SPEED);
+    if (currentState == STATE_CALIBRATING) {
+      stepper1->setSpeedInHz(CALIB_SPEED);
+      stepper2->setSpeedInHz(CALIB_SPEED);
+      stepper1->runForward();
+      stepper2->runForward();
+    }
   }
   else if (command == "PUMP:DOWN") {
-    if (currentState == STATE_CALIBRATING) setDualPumpsSpeed(-CALIB_SPEED);
+    if (currentState == STATE_CALIBRATING) {
+      stepper1->setSpeedInHz(CALIB_SPEED);
+      stepper2->setSpeedInHz(CALIB_SPEED);
+      stepper1->runBackward();
+      stepper2->runBackward();
+    }
   }
   else if (command == "PUMP:STOP") {
     if (currentState == STATE_DRAINING_ZERO) {
@@ -577,7 +594,7 @@ void processCalibrationCommand(String command) {
     if (currentState != STATE_CALIBRATING) return;
 
     stopDualPumps();
-    long stepsMade = stepper1.currentPosition();
+    long stepsMade = stepper1->getCurrentPosition();
 
     if (stepsMade <= 0) {
       Serial.printf("[CALIB] Refused : %ld steps since last rung (must be > 0). Use PUMP:UP.\n", stepsMade);
@@ -597,13 +614,16 @@ void processCalibrationCommand(String command) {
       Serial.printf("[CALIB] total steps recorded : %ld steps\n", totalAccumulatedSteps);
       Serial.println("==========================================");
 
-      stepper1.setCurrentPosition(0);
-      stepper2.setCurrentPosition(0);
+      stepper1->setCurrentPosition(0);
+      stepper2->setCurrentPosition(0);
 
       if (currentCalibrationRung >= maxTargetRungCoef120) {
         finishCalibration();
       } else {
-        setDualPumpsSpeed(CALIB_SPEED);
+        stepper1->setSpeedInHz(CALIB_SPEED);
+        stepper2->setSpeedInHz(CALIB_SPEED);
+        stepper1->runForward();
+        stepper2->runForward();
       }
     }
   }
@@ -614,9 +634,9 @@ void processCalibrationCommand(String command) {
       stopDualPumps();
 
       // Restore the ABSOLUTE position (motor position was relative to the last rung)
-      long absolutePos = convertRungToAbsoluteSteps(currentCalibrationRung) + stepper1.currentPosition();
-      stepper1.setCurrentPosition(absolutePos);
-      stepper2.setCurrentPosition(absolutePos);
+      long absolutePos = convertRungToAbsoluteSteps(currentCalibrationRung) + stepper1->getCurrentPosition();
+      stepper1->setCurrentPosition(absolutePos);
+      stepper2->setCurrentPosition(absolutePos);
 
       currentState = STATE_IDLE;
       savePositionsToRTC();
@@ -638,8 +658,8 @@ void finishCalibration() {
   }
 
   long totalStepsCurrent = convertRungToAbsoluteSteps(currentCalibrationRung);
-  stepper1.setCurrentPosition(totalStepsCurrent);
-  stepper2.setCurrentPosition(totalStepsCurrent);
+  stepper1->setCurrentPosition(totalStepsCurrent);
+  stepper2->setCurrentPosition(totalStepsCurrent);
 
   currentState = STATE_IDLE;
   savePositionsToRTC();
@@ -695,8 +715,8 @@ bool calculateScaleFromTides(float highTideHeight, float lowTideHeight, int coef
   // 4. high tide coef 120 = rung 20 by construction (no float ceil() rounding issue)
   maxTargetRungCoef120 = 2 * MEAN_LEVEL_RUNG_INDEX;
 
-  Serial.printf("[SCALE] Half tide (rung 10) : %.2f m | height/rung : %.3f m | Low tide Coef 120 (Rung 0) : %.2f m\n",
-                meanWaterLevelHeight, stepHeightPerRung, meanWaterLevelHeight - halfRange120);
+  Serial.printf("[SCALE] Half tide (rung %i) : %.2f m | height/rung : %.3f m | Low tide Coef 120 (Rung 0) : %.2f m\n",
+                MEAN_LEVEL_RUNG_INDEX, meanWaterLevelHeight, stepHeightPerRung, meanWaterLevelHeight - halfRange120);
   return true;
 }
 
@@ -929,7 +949,7 @@ int getCurrentRungFromPosition() {
     return currentCalibrationRung;
   }
 
-  long currentPos = stepper1.currentPosition();
+  long currentPos = stepper1->getCurrentPosition();
   if (currentPos <= 0) return 0;
 
   // read cumulated steps to determine current rung
@@ -942,4 +962,44 @@ int getCurrentRungFromPosition() {
   }
 
   return TOTAL_RUNGS;
+}
+
+void setRungPosition(int targetRung) {
+  if (targetRung < 0) targetRung = 0;
+  if (targetRung > TOTAL_RUNGS) targetRung = TOTAL_RUNGS;
+
+  long targetSteps = convertRungToAbsoluteSteps(targetRung);
+
+  // Mettre à jour la position courante des moteurs
+  stepper1->setCurrentPosition(targetSteps);
+  stepper2->setCurrentPosition(targetSteps);
+  
+  isHomed = true;
+
+  // Si le système est en cours de vidage (HOMING), on stoppe le vidage
+  if (currentState == STATE_DRAINING_ZERO) {
+    stopDualPumps();
+    digitalWrite(LED_PIN, LOW);
+    currentState = STATE_NORMAL;
+    Serial.println("[SYSTEM] Homing interrupted by manual rung selection -> Switch to NORMAL MODE.");
+  }
+
+  // Sauvegarder les nouvelles positions dans la RAM RTC
+  savePositionsToRTC();
+
+  Serial.println("==========================================");
+  Serial.printf("[SYSTEM] Position manually set to rung %d -> Target steps : %ld\n", targetRung, targetSteps);
+  Serial.println("[LOG] Values for each rung :");
+  for (int i = 1; i <= TOTAL_RUNGS; i++) {
+    long absSteps = convertRungToAbsoluteSteps(i);
+    Serial.printf("  - Rung %2d : relatif = %5ld steps | absolute = %6ld steps\n", 
+                  i, rungRelativeSteps[i - 1], absSteps);
+  }
+  Serial.println("==========================================");
+
+  // Si l'horloge est en mode normal, recalculer et relancer immédiatement le ciblage pour l'heure H+1
+  if (currentState == STATE_NORMAL) {
+    lastFetchedHour = -1; 
+    updateCurrentTideLevel();
+  }
 }
